@@ -1,6 +1,6 @@
 """
 Broker Trends API routes
-Provides endpoints for Orlando broker trends prediction
+Provides endpoints for business brokerage trends prediction
 """
 
 import traceback
@@ -18,7 +18,7 @@ logger = get_logger('mirofish.api.broker_trends')
 @broker_trends_bp.route('/predict', methods=['POST'])
 def predict():
     """
-    Start an Orlando broker trends prediction.
+    Start a business brokerage trends prediction.
 
     Request (JSON):
         {
@@ -186,6 +186,41 @@ def get_prediction(prediction_id: str):
 
     except Exception as e:
         logger.error(f"Failed to get prediction: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@broker_trends_bp.route('/pipeline/health', methods=['GET'])
+def pipeline_health():
+    """
+    Get data pipeline health status.
+
+    Shows all registered data sources, their trust tiers, health metrics,
+    circuit breaker states, and overall pipeline viability.
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "pipeline_viable": true,
+                "breaker_states": {...},
+                "alerts": [...],
+                "source_health": {...}
+            }
+        }
+    """
+    try:
+        service = BrokerTrendService()
+        health = service.get_pipeline_health()
+        return jsonify({
+            "success": True,
+            "data": health
+        })
+    except Exception as e:
+        logger.error(f"Failed to get pipeline health: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),

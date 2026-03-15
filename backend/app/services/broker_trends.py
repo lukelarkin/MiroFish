@@ -1,7 +1,13 @@
 """
-Orlando Broker Trends Prediction Service
+Business Brokerage Trends Prediction Service
+
 Orchestrates the end-to-end prediction pipeline:
-LLM seed content -> Ontology -> Knowledge Graph -> Simulation -> Report
+    Data Sources → Validation Layer → Seed Content → Ontology → Knowledge Graph → Simulation → Report
+
+The validation layer ensures that predictions are grounded in cross-validated
+data from multiple sources with actuarial-style confidence scoring. No single
+source can dominate the pipeline. The system refuses to generate predictions
+when data quality is insufficient.
 """
 
 import os
@@ -22,65 +28,83 @@ from .graph_builder import GraphBuilderService
 from .simulation_manager import SimulationManager, SimulationStatus
 from .simulation_runner import SimulationRunner, RunnerStatus
 from .report_agent import ReportAgent, ReportManager, ReportStatus
+from .data_pipeline import (
+    DataPipeline, LLMSyntheticSource,
+    SBADataSource, FREDDataSource, BizBuySellSource, IBBAMarketPulseSource,
+)
 
 logger = get_logger('mirofish.broker_trends')
 
 
 class BrokerTrendService:
     """
-    Orlando Broker Trends Prediction Orchestrator
+    Business Brokerage Trends Prediction Orchestrator
 
-    Generates seed content about Orlando real estate via LLM,
-    then drives it through the existing MiroFish pipeline.
+    Collects data from multiple sources, validates and cross-references it,
+    then drives validated intelligence through the MiroFish simulation pipeline
+    to predict business brokerage market trends.
+
+    Domain: Small/mid-market business acquisitions (not real estate).
+    Target user: Business brokers who buy and sell companies.
     """
 
     SIMULATION_REQUIREMENT = (
-        "Simulate how Orlando, Florida real estate market stakeholders -- brokers, "
-        "buyers, sellers, investors, developers, and city planners -- discuss and react "
-        "to current market trends on social media. Focus on housing prices, inventory, "
-        "interest rates, insurance costs, new construction, population growth, "
-        "tourism/theme park effects, infrastructure developments, and rental market dynamics."
+        "Simulate how US small and mid-market business brokerage stakeholders -- "
+        "business brokers, acquisition entrepreneurs, SBA lenders, business sellers, "
+        "private equity searchers, franchise consultants, and M&A advisors -- discuss "
+        "and react to current market conditions on social media. Focus on deal flow, "
+        "SBA 7(a) lending environment, business valuations and multiples by sector "
+        "(HVAC, plumbing, home services, landscaping, auto repair, restaurants, "
+        "professional services, manufacturing, e-commerce, SaaS), buyer competition, "
+        "seller motivations (retirement, burnout, regulatory pressure), interest rate "
+        "impacts on deal financing, and emerging acquisition trends."
     )
 
-    SEED_CONTENT_PROMPT = """You are a real estate market research analyst specializing in Central Florida.
-Write a comprehensive market analysis document (3000-5000 words) about the current Orlando, Florida
-real estate market. This document will be used as source material for a multi-agent social media
-simulation, so include specific named entities, organizations, and locations.
+    SEED_CONTENT_PROMPT = """You are a business brokerage market analyst specializing in US small
+and mid-market business acquisitions.
 
-Cover all of the following topics with specific data points and named entities:
+Write a comprehensive market analysis document (3000-5000 words) about the current US business
+brokerage market. This document will be used as source material for a multi-agent social media
+simulation, so include specific named entities, organizations, and data points.
 
-1. **Housing Market Trends**: Current median home prices, inventory levels, days on market,
-   year-over-year changes in Orange, Seminole, Osceola, and Lake counties.
+Cover all of the following topics:
 
-2. **Population Growth & Migration**: In-migration patterns, top origin states, demographic shifts,
-   impact on housing demand. Reference Orlando Regional Realtor Association data.
+1. **SBA Lending Environment**: Current SBA 7(a) loan volumes, approval rates, average loan sizes,
+   default rates by industry. How the prime rate (currently prime + 2.75% for SBA) affects deal
+   financing. Reference SBA district offices and preferred lenders.
 
-3. **Interest Rate Impacts**: How current Federal Reserve policy affects Central Florida mortgage
-   rates, buyer affordability, and market velocity.
+2. **Deal Flow & Multiples**: Current asking multiples (SDE, EBITDA, revenue) by sector.
+   Reference BizBuySell, BizQuest, DealStats data. Which sectors command premium multiples
+   (home services, SaaS) vs discount multiples (restaurants, retail).
 
-4. **Commercial Real Estate**: Office, retail, and industrial sectors. Tech corridor growth along
-   I-4, tourism-driven hospitality real estate near International Drive and theme parks.
+3. **Buyer Demand**: Profile of today's business buyer — search fund operators, ETA candidates,
+   corporate refugees, private equity platform acquisitions, immigrant entrepreneurs.
+   Reference IBBA Market Pulse Survey data on buyer activity.
 
-5. **Rental Market Dynamics**: Average rents, vacancy rates, build-to-rent communities,
-   short-term rental regulation (Airbnb/VRBO).
+4. **Seller Motivations**: Baby Boomer retirement wave (Silver Tsunami), COVID burnout sellers,
+   regulatory-driven exits, strategic timing. Average age of business sellers, owner dependency
+   risk factors.
 
-6. **New Construction & Development**: Major builders (DR Horton, Lennar, Pulte, Toll Brothers),
-   master-planned communities in Lake Nona, Horizon West, Winter Garden, Kissimmee corridor.
-   Mention specific developments and unit counts.
+5. **Hot Sectors for Acquisition**: HVAC, plumbing, electrical, pest control, landscaping,
+   auto repair, dental practices, veterinary clinics, home health, IT managed services.
+   Why these sectors and what makes them attractive (recurring revenue, essential services,
+   fragmented markets, roll-up potential).
 
-7. **Insurance & Climate Risk**: Homeowners insurance crisis, Citizens Property Insurance,
-   hurricane risk premiums, flood zone impacts, roof age requirements.
+6. **Cold Sectors / Risk Areas**: Restaurants, brick-and-mortar retail, print media,
+   travel agencies. Why these are challenging and what the risk factors are.
 
-8. **Tourism & Theme Park Effects**: Walt Disney World, Universal Orlando Resort (Epic Universe),
-   Central Florida Tourism Oversight District, impact on local employment and housing demand.
+7. **Franchise Resales**: FDD-based valuations, franchise broker networks (Murphy Business,
+   Transworld, Sunbelt Business Brokers), territory rights, franchisor approval process.
 
-9. **Infrastructure Developments**: SunRail expansion, I-4 Ultimate completion, Orlando
-   International Airport South Terminal (Terminal C), Brightline high-speed rail, their effects
-   on property values in surrounding neighborhoods.
+8. **Due Diligence Red Flags**: Customer concentration, owner dependency, declining revenue trends,
+   lease risk, key employee risk, unreported cash/tax issues. How brokers spot and price these.
 
-Write in an authoritative, data-rich style. Use specific neighborhood names, company names,
-government agencies, and real organizations throughout. Structure the document with clear section
-headers."""
+9. **Market Outlook**: Interest rate trajectory, SBA policy changes, demographic trends affecting
+   deal flow over the next 12-24 months. Economic indicators that signal deal volume shifts.
+
+Write in an authoritative, data-rich style. Use specific company names, industry associations
+(IBBA, M&A Source, Alliance of M&A Advisors), government agencies (SBA, BLS), and data
+providers throughout. Structure the document with clear section headers."""
 
     # Prediction state storage directory
     PREDICTIONS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'predictions')
@@ -88,7 +112,39 @@ headers."""
     def __init__(self):
         self.llm_client = LLMClient()
         self.task_manager = TaskManager()
+        self.pipeline = self._init_pipeline()
         os.makedirs(self.PREDICTIONS_DIR, exist_ok=True)
+
+    def _init_pipeline(self) -> DataPipeline:
+        """Initialize the data validation pipeline with all available sources."""
+        pipeline = DataPipeline()
+
+        # Register sources in order of trust tier
+
+        # TIER_1: Government / institutional
+        pipeline.register_source(SBADataSource(
+            api_key=os.environ.get('SBA_API_KEY')
+        ))
+        pipeline.register_source(FREDDataSource(
+            api_key=os.environ.get('FRED_API_KEY')
+        ))
+
+        # TIER_2: Industry data providers
+        pipeline.register_source(BizBuySellSource(
+            api_key=os.environ.get('BIZBUYSELL_API_KEY')
+        ))
+        pipeline.register_source(IBBAMarketPulseSource())
+
+        # SYNTHETIC: LLM-generated (always last, lowest trust)
+        pipeline.register_source(LLMSyntheticSource(
+            llm_client=self.llm_client
+        ))
+
+        logger.info(
+            f"Data pipeline initialized with {pipeline.registry.source_count} sources. "
+            f"Coverage: {pipeline.registry.category_coverage}"
+        )
+        return pipeline
 
     def _get_prediction_dir(self, prediction_id: str) -> str:
         pred_dir = os.path.join(self.PREDICTIONS_DIR, prediction_id)
@@ -111,15 +167,61 @@ headers."""
             return json.load(f)
 
     def generate_seed_content(self) -> str:
-        """Generate Orlando real estate market analysis via LLM."""
+        """
+        Generate validated seed content through the data pipeline.
+
+        NEW FLOW:
+        1. Run data pipeline (fetch → validate → cross-reference)
+        2. If gate is open (enough validated data), use validated seed text
+        3. If gate is closed, fall back to LLM generation with a warning
+           that the output is UNVALIDATED
+
+        Returns:
+            Validated seed text with confidence annotations,
+            or unvalidated LLM text with warning header.
+        """
+        logger.info("Running data pipeline for seed content generation...")
+
+        # Try validated path first
+        pipeline_result = self.pipeline.run()
+
+        if pipeline_result["gate_open"]:
+            seed_text = pipeline_result["seed_text"]
+            stats = pipeline_result["stats"]
+            logger.info(
+                f"Validated seed content generated: "
+                f"{stats.get('actionable', 0)} actionable claims, "
+                f"avg confidence {stats.get('avg_confidence', 0):.2f}"
+            )
+            return seed_text
+
+        # Gate closed — fall back to unvalidated LLM generation
+        # This is the existing behavior, but now properly labeled
+        gate_reason = pipeline_result["gate_reason"]
+        logger.warning(
+            f"Data pipeline gate CLOSED: {gate_reason}. "
+            f"Falling back to unvalidated LLM generation."
+        )
+
         messages = [
             {"role": "user", "content": self.SEED_CONTENT_PROMPT}
         ]
-        return self.llm_client.chat(
+        llm_text = self.llm_client.chat(
             messages=messages,
             temperature=0.7,
             max_tokens=8192
         )
+
+        # Prepend warning header so downstream consumers know this is unvalidated
+        warning_header = (
+            "# WARNING: UNVALIDATED CONTENT\n\n"
+            f"**Data pipeline gate was CLOSED:** {gate_reason}\n\n"
+            "This content was generated by LLM without cross-validation against "
+            "real data sources. Confidence intervals are not available. "
+            "All claims should be treated as SYNTHETIC with LOW confidence.\n\n"
+            "---\n\n"
+        )
+        return warning_header + llm_text
 
     def start_prediction(self) -> Dict[str, Any]:
         """
@@ -131,7 +233,7 @@ headers."""
         prediction_id = f"pred_{uuid.uuid4().hex[:12]}"
 
         # Create project
-        project = ProjectManager.create_project(name="Orlando Broker Trends Prediction")
+        project = ProjectManager.create_project(name="Business Brokerage Trends Prediction")
 
         # Create tracking task
         task_id = self.task_manager.create_task(
@@ -172,17 +274,48 @@ headers."""
         pred_state = self._load_prediction_state(prediction_id)
 
         try:
-            # ===== Stage 1: Generate seed content (0-10%) =====
+            # ===== Stage 0: Data validation pipeline (0-5%) =====
             self.task_manager.update_task(
                 task_id,
                 status=TaskStatus.PROCESSING,
                 progress=0,
-                message="Generating Orlando real estate market analysis..."
+                message="Running data validation pipeline..."
+            )
+            pred_state["current_stage"] = "data_validation"
+            self._save_prediction_state(prediction_id, pred_state)
+
+            pipeline_result = self.pipeline.run()
+            pipeline_health = pipeline_result.get("health", {})
+
+            # Save pipeline health to prediction state for diagnostics
+            pred_state["pipeline_health"] = {
+                "gate_open": pipeline_result["gate_open"],
+                "gate_reason": pipeline_result["gate_reason"],
+                "stats": pipeline_result.get("stats", {}),
+            }
+            self._save_prediction_state(prediction_id, pred_state)
+
+            self.task_manager.update_task(
+                task_id, progress=5,
+                message=(
+                    f"Data pipeline: {'VALIDATED' if pipeline_result['gate_open'] else 'UNVALIDATED (fallback)'} "
+                    f"— {pipeline_result['gate_reason']}"
+                )
+            )
+
+            # ===== Stage 1: Generate seed content (5-10%) =====
+            self.task_manager.update_task(
+                task_id, progress=6,
+                message="Generating business brokerage market analysis..."
             )
             pred_state["current_stage"] = "generating_seed_content"
             self._save_prediction_state(prediction_id, pred_state)
 
-            seed_text = self.generate_seed_content()
+            if pipeline_result["gate_open"]:
+                seed_text = pipeline_result["seed_text"]
+            else:
+                # Fallback to LLM generation
+                seed_text = self.generate_seed_content()
 
             # Save seed text to project
             ProjectManager.save_extracted_text(project_id, seed_text)
@@ -239,7 +372,7 @@ headers."""
             graph_task_id = graph_builder.build_graph_async(
                 text=seed_text,
                 ontology=ontology,
-                graph_name="Orlando Broker Trends Graph"
+                graph_name="Business Brokerage Trends Graph"
             )
 
             # Poll for graph build completion
@@ -411,7 +544,8 @@ headers."""
                 "simulation_id": simulation_id,
                 "report_id": report.report_id,
                 "graph_id": graph_id,
-                "status": "completed"
+                "status": "completed",
+                "validated": pipeline_result["gate_open"],
             })
 
             logger.info(f"Broker trends prediction completed: {prediction_id}")
@@ -427,3 +561,7 @@ headers."""
             self._save_prediction_state(prediction_id, pred_state)
 
             self.task_manager.fail_task(task_id, error_msg)
+
+    def get_pipeline_health(self) -> Dict[str, Any]:
+        """Get current data pipeline health status."""
+        return self.pipeline.run_health_check()

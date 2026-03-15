@@ -178,18 +178,17 @@ class CrossValidator:
         """
         Group related claims together.
 
-        Simple clustering by claim_type + direction + naics_code.
-        More sophisticated semantic clustering can be added later.
+        Clusters by category + claim_type + naics_code + geography.
+        Direction is NOT part of the key — direction is what we COMPARE
+        within a cluster to detect contradictions.
         """
         clusters: Dict[str, ClaimCluster] = {}
 
         for claim in claims:
-            # Build cluster key from claim attributes
+            # Build cluster key from topic attributes (NOT direction)
             key_parts = [claim.category.value, claim.claim_type.value]
             if claim.naics_code:
                 key_parts.append(claim.naics_code)
-            if claim.direction:
-                key_parts.append(claim.direction)
             if claim.geography:
                 key_parts.append(claim.geography)
 
@@ -235,13 +234,21 @@ class CrossValidator:
         has_conflict = len(directions) > 1
 
         # Check for value conflicts (>20% disagreement on metrics)
+        # Uses pairwise comparison — if ANY two values disagree by >20%,
+        # that's a conflict worth flagging.
         values = [c.value for c in cluster.claims if c.value is not None]
         value_conflict = False
         if len(values) >= 2:
-            mean_val = sum(values) / len(values)
-            if mean_val != 0:
-                max_deviation = max(abs(v - mean_val) / abs(mean_val) for v in values)
-                value_conflict = max_deviation > 0.20
+            for i in range(len(values)):
+                for j in range(i + 1, len(values)):
+                    ref = max(abs(values[i]), abs(values[j]))
+                    if ref > 0:
+                        pct_diff = abs(values[i] - values[j]) / ref
+                        if pct_diff > 0.20:
+                            value_conflict = True
+                            break
+                if value_conflict:
+                    break
 
         has_conflict = has_conflict or value_conflict
 
@@ -338,10 +345,11 @@ class CrossValidator:
             if (a.direction, b.direction) in opposites:
                 return True
 
-        # Value contradiction (>20% disagreement)
+        # Value contradiction (>20% disagreement, pairwise)
         if a.value is not None and b.value is not None:
-            if a.value != 0:
-                deviation = abs(a.value - b.value) / abs(a.value)
+            ref = max(abs(a.value), abs(b.value))
+            if ref > 0:
+                deviation = abs(a.value - b.value) / ref
                 if deviation > 0.20:
                     return True
 

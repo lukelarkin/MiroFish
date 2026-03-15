@@ -763,9 +763,9 @@ class TestFullPipeline:
 
         result = pipeline.run()
         assert result["stats"]["total"] > 0
-        # Should detect the conflict
-        conflict_count = result["stats"].get("conflicts", 0)
-        assert conflict_count >= 0  # At least we ran without crashing
+        # Should detect the conflict — all 3 claims land in same cluster,
+        # contradicting directions should produce CONFLICT consensus
+        assert result["stats"]["conflicts"] >= 1
 
     def test_failing_source_doesnt_crash_pipeline(self):
         """A failing source should be circuit-broken, not crash everything."""
@@ -854,6 +854,655 @@ class TestCrossValidationSpecifics:
         results = validator.validate_claims([claim])
         # Even TIER_1 (0.9 weight) should be capped at 0.35 base
         assert results[0].confidence <= 0.5  # LOW consensus * capped weight
+
+
+# ── Round 1 Improvements: Gap Coverage ──────────────────────────
+
+class TestCircuitBreakerSelfHealing:
+    """Test the full CLOSED → OPEN → HALF_OPEN → CLOSED recovery cycle."""
+
+    def test_full_recovery_lifecycle(self):
+        """Source fails, gets cut off, recovers, gets restored."""
+        registry = SourceRegistry()
+        source = MockTier1Source("healing_src")
+        registry.register(source)
+        breaker = CircuitBreaker(registry)
+
+        # 1. Start CLOSED
+        b = breaker.get_breaker("healing_src")
+        assert b.state == BreakerState.CLOSED
+        assert breaker.should_allow_source("healing_src") is True
+
+        # 2. Simulate failures → OPEN
+        for _ in range(5):
+            source.health.record_fetch_failure("fail")
+        breaker.check_source_health(source)
+        assert b.state == BreakerState.OPEN
+        assert breaker.should_allow_source("healing_src") is False
+        assert source.health.is_degraded is True
+
+        # 3. Force the cooldown to have passed (manipulate timestamp)
+        b.last_state_change = datetime(2020, 1, 1)
+
+        # 4. Should transition to HALF_OPEN
+        assert breaker.should_allow_source("healing_src") is True
+        assert b.state == BreakerState.HALF_OPEN
+
+        # 5. Record successes → should close after HALF_OPEN_TEST_WINDOW (3)
+        breaker.record_source_success("healing_src")
+        assert b.state == BreakerState.HALF_OPEN  # Not yet
+        breaker.record_source_success("healing_src")
+        assert b.state == BreakerState.HALF_OPEN  # Not yet
+        breaker.record_source_success("healing_src")
+        assert b.state == BreakerState.CLOSED  # Recovered!
+        assert source.health.is_degraded is False
+
+    def test_half_open_failure_reopens(self):
+        """If a source fails during HALF_OPEN test, go back to OPEN."""
+        registry = SourceRegistry()
+        source = MockTier1Source("fragile_src")
+        registry.register(source)
+        breaker = CircuitBreaker(registry)
+
+        b = breaker.get_breaker("fragile_src")
+        # Force to HALF_OPEN
+        b.state = BreakerState.HALF_OPEN
+        b.success_count_since_half_open = 1
+
+        # Fail during recovery
+        breaker.record_source_failure("fragile_src")
+        assert b.state == BreakerState.OPEN  # Back to OPEN
+
+
+class TestClaimVolumeSpike:
+    """Test that sudden volume spikes are detected."""
+
+    def test_spike_detected(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("spike_src"))
+        breaker = CircuitBreaker(registry)
+
+        # Build up normal volume history
+        breaker.check_claim_volume("spike_src", 10)
+        breaker.check_claim_volume("spike_src", 12)
+        breaker.check_claim_volume("spike_src", 11)
+
+        # Spike: 10x normal
+        alerts = breaker.check_claim_volume("spike_src", 100)
+        assert len(alerts) >= 1
+        assert "spike" in alerts[0].message.lower()
+
+    def test_normal_variation_no_alert(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("steady_src"))
+        breaker = CircuitBreaker(registry)
+
+        breaker.check_claim_volume("steady_src", 10)
+        breaker.check_claim_volume("steady_src", 12)
+        breaker.check_claim_volume("steady_src", 11)
+
+        # Slight increase — no spike
+        alerts = breaker.check_claim_volume("steady_src", 15)
+        assert len(alerts) == 0
+
+
+class TestSyntheticOnlyBlocked:
+    """SYNTHETIC-only claims should never be actionable."""
+
+    def test_synthetic_source_alone_is_unvalidated(self):
+        registry = SourceRegistry()
+
+        class MockSyntheticSource(DataSource):
+            def __init__(self):
+                super().__init__(
+                    source_id="llm_mock",
+                    trust_tier=TrustTier.SYNTHETIC,
+                    categories=[ClaimCategory.MARKET_SENTIMENT],
+                )
+            def fetch_claims(self, category=None, **kwargs):
+                self._record_fetch_success()
+                return self._claims
+            _claims = []
+
+        synth = MockSyntheticSource()
+        synth._claims = [
+            _make_claim("llm_mock", f"LLM says {i}",
+                        ClaimCategory.MARKET_SENTIMENT, ClaimType.SENTIMENT,
+                        claim_id=f"synth_{i}")
+            for i in range(10)
+        ]
+        registry.register(synth)
+        validator = CrossValidator(registry)
+
+        results = validator.validate_claims(synth._claims)
+        # Every claim should be UNVALIDATED — none actionable
+        for r in results:
+            assert r.consensus == ConsensusLevel.UNVALIDATED
+            assert not r.is_actionable
+
+
+class TestConflictResolution:
+    """Test the three automatic resolution paths."""
+
+    def _setup(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("gov_a"))
+        registry.register(MockTier1Source("gov_b"))
+        registry.register(MockTier2Source("ind_c"))
+        return registry, CrossValidator(registry)
+
+    def test_tier1_consensus_wins_conflict(self):
+        """When TIER_1 sources agree, they override TIER_2 contradiction."""
+        registry, validator = self._setup()
+
+        claims = [
+            _make_claim("gov_a", "Rate up", ClaimCategory.INTEREST_RATES,
+                        ClaimType.TREND, direction="up", claim_id="ga"),
+            _make_claim("gov_b", "Rate rising", ClaimCategory.INTEREST_RATES,
+                        ClaimType.TREND, direction="up", claim_id="gb"),
+            _make_claim("ind_c", "Rate down", ClaimCategory.INTEREST_RATES,
+                        ClaimType.TREND, direction="down", claim_id="ic"),
+        ]
+        results = validator.validate_claims(claims)
+        # Should detect conflict but attempt resolution
+        assert any(
+            r.conflict_resolution.value != "unresolved"
+            for r in results if r.consensus == ConsensusLevel.CONFLICT
+        )
+
+    def test_majority_wins_conflict(self):
+        """When 2 of 3 equal-tier sources agree, majority wins."""
+        registry = SourceRegistry()
+        registry.register(MockTier2Source("t2_a"))
+        registry.register(MockTier2Source("t2_b"))
+        registry.register(MockTier2Source("t2_c"))
+        validator = CrossValidator(registry)
+
+        claims = [
+            _make_claim("t2_a", "Up", ClaimCategory.DEAL_MULTIPLES,
+                        ClaimType.TREND, direction="up", claim_id="a1"),
+            _make_claim("t2_b", "Up too", ClaimCategory.DEAL_MULTIPLES,
+                        ClaimType.TREND, direction="up", claim_id="b1"),
+            _make_claim("t2_c", "Down", ClaimCategory.DEAL_MULTIPLES,
+                        ClaimType.TREND, direction="down", claim_id="c1"),
+        ]
+        results = validator.validate_claims(claims)
+        # Conflict exists, and resolution should mention majority
+        conflict_results = [r for r in results if r.consensus == ConsensusLevel.CONFLICT]
+        assert len(conflict_results) >= 1
+        resolutions = [r.conflict_resolution.value for r in conflict_results]
+        assert any(r in ("majority", "tier_weight", "recency") for r in resolutions)
+
+
+class TestEffectiveWeightEvolution:
+    """Test that source weight adapts based on track record."""
+
+    def test_weight_improves_with_validation_history(self):
+        source = MockTier1Source("evolving")
+        initial_weight = source.effective_weight
+
+        # Build good track record: 20 claims, all validated
+        for _ in range(20):
+            source.health.total_claims += 1
+            source.health.record_claim_validated()
+            source.health.record_fetch_success()
+
+        evolved_weight = source.effective_weight
+        # With perfect track record, weight should be higher than the
+        # no-history penalty (80% of base)
+        assert evolved_weight > initial_weight
+
+    def test_weight_drops_with_contradictions(self):
+        source = MockTier1Source("degrading")
+
+        # Build bad track record: 20 claims, all contradicted
+        for _ in range(20):
+            source.health.total_claims += 1
+            source.health.record_claim_contradicted()
+            source.health.record_fetch_success()
+
+        # Validation rate = 0, so effective_trust = 0
+        # Weight = 0.9 * 0.6 + 0 * 0.4 = 0.54, floored at 0.9 * 0.5 = 0.45
+        assert source.effective_weight == pytest.approx(0.54, abs=0.01)
+        assert source.effective_weight < source.base_weight
+
+
+class TestEdgeCases:
+    """Edge cases that could crash the pipeline."""
+
+    def test_empty_claims_list(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("src"))
+        validator = CrossValidator(registry)
+        results = validator.validate_claims([])
+        assert results == []
+
+    def test_duplicate_source_registration(self):
+        registry = SourceRegistry()
+        src1 = MockTier1Source("dupe")
+        src2 = MockTier1Source("dupe")
+        registry.register(src1)
+        registry.register(src2)
+        # Second registration should overwrite, not duplicate
+        assert registry.source_count == 1
+
+    def test_zero_value_claims_dont_crash(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("src_a"))
+        registry.register(MockTier2Source("src_b"))
+        validator = CrossValidator(registry)
+
+        claims = [
+            _make_claim("src_a", "Zero metric", ClaimCategory.SBA_LENDING,
+                        ClaimType.METRIC, value=0, claim_id="z1"),
+            _make_claim("src_b", "Also zero", ClaimCategory.SBA_LENDING,
+                        ClaimType.METRIC, value=0, claim_id="z2"),
+        ]
+        # Should not raise ZeroDivisionError
+        results = validator.validate_claims(claims)
+        assert len(results) == 2
+
+    def test_negative_value_claims(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("src"))
+        validator = CrossValidator(registry)
+
+        claim = _make_claim("src", "Decline", ClaimCategory.ECONOMIC_INDICATORS,
+                            ClaimType.METRIC, value=-15.5, claim_id="neg")
+        results = validator.validate_claims([claim])
+        assert len(results) == 1
+        assert results[0].claim.value == -15.5
+
+    def test_claim_fingerprint_uniqueness(self):
+        """Different claims should have different fingerprints."""
+        c1 = _make_claim("src", "Claim A", ClaimCategory.SBA_LENDING,
+                         ClaimType.METRIC, value=100, claim_id="fp1")
+        c2 = _make_claim("src", "Claim B", ClaimCategory.SBA_LENDING,
+                         ClaimType.METRIC, value=200, claim_id="fp2")
+        assert c1.fingerprint != c2.fingerprint
+
+    def test_claim_staleness(self):
+        """Claim with expired TTL should report as stale."""
+        c = _make_claim("src", "Old", ClaimCategory.SBA_LENDING,
+                        ClaimType.METRIC, claim_id="stale_edge")
+        c.ttl_hours = 1.0
+        c.timestamp = datetime(2020, 1, 1)
+        assert c.is_stale is True
+
+        fresh = _make_claim("src", "New", ClaimCategory.SBA_LENDING,
+                            ClaimType.METRIC, claim_id="fresh_edge")
+        fresh.ttl_hours = 9999.0
+        assert fresh.is_stale is False
+
+    def test_store_clear_resets(self):
+        """Store clear should reset all state."""
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("s1"))
+        validator = CrossValidator(registry)
+        breaker = CircuitBreaker(registry)
+        store = ValidatedDataStore(registry, validator, breaker)
+
+        # Add some data
+        results = [ValidationResult(
+            claim=_make_claim("s1", "test", ClaimCategory.SBA_LENDING,
+                              ClaimType.METRIC, claim_id="clr1"),
+            consensus=ConsensusLevel.HIGH,
+            confidence=0.9,
+            confidence_interval=(0.8, 0.95),
+        )]
+        store.ingest(results)
+        assert len(store.get_all()) == 1
+
+        store.clear()
+        assert len(store.get_all()) == 0
+
+
+class TestExportStructure:
+    """Verify export formats contain correct metadata."""
+
+    def _populated_store(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("s1"))
+        registry.register(MockTier2Source("s2"))
+        validator = CrossValidator(registry)
+        breaker = CircuitBreaker(registry)
+        store = ValidatedDataStore(registry, validator, breaker)
+
+        results = []
+        for i in range(4):
+            results.append(ValidationResult(
+                claim=_make_claim(
+                    "s1", f"SBA claim {i}", ClaimCategory.SBA_LENDING,
+                    ClaimType.METRIC, value=100 + i, claim_id=f"exp_sba_{i}"),
+                consensus=ConsensusLevel.HIGH,
+                confidence=0.85 - (i * 0.05),
+                confidence_interval=(0.7, 0.95),
+            ))
+        for i in range(3):
+            results.append(ValidationResult(
+                claim=_make_claim(
+                    "s2", f"Deal claim {i}", ClaimCategory.DEAL_MULTIPLES,
+                    ClaimType.TREND, value=2.5 + i, direction="up",
+                    claim_id=f"exp_deal_{i}"),
+                consensus=ConsensusLevel.MEDIUM,
+                confidence=0.65,
+                confidence_interval=(0.5, 0.8),
+            ))
+        store.ingest(results)
+        return store
+
+    def test_simulation_export_has_confidence_metadata(self):
+        store = self._populated_store()
+        export = store.export_for_simulation()
+
+        assert export["gate_status"] == "open"
+        assert export["total_claims"] == 7
+        assert "sba_lending" in export["categories"]
+        assert "deal_multiples" in export["categories"]
+
+        # Check claim structure
+        sba_claims = export["categories"]["sba_lending"]["claims"]
+        assert len(sba_claims) == 4
+        for claim in sba_claims:
+            assert "confidence" in claim
+            assert "ci_lower" in claim
+            assert "ci_upper" in claim
+            assert "consensus" in claim
+            assert "source_count" in claim
+            assert claim["confidence"] > 0
+
+        # Should be sorted by confidence (descending)
+        confidences = [c["confidence"] for c in sba_claims]
+        assert confidences == sorted(confidences, reverse=True)
+
+    def test_seed_text_export_has_confidence_annotations(self):
+        store = self._populated_store()
+        seed_text = store.export_as_seed_text()
+
+        assert "Validated Market Intelligence" in seed_text
+        assert "HIGH" in seed_text or "MEDIUM" in seed_text
+        assert "confidence" in seed_text.lower()
+        assert "sources" in seed_text.lower()
+        # Should contain actual claim statements
+        assert "SBA claim" in seed_text
+        assert "Deal claim" in seed_text
+
+    def test_health_report_structure(self):
+        store = self._populated_store()
+        report = store.health_report()
+
+        assert "gate_status" in report
+        assert "total_stored" in report
+        assert report["total_stored"] == 7
+        assert "confidence_summary" in report
+        summary = report["confidence_summary"]
+        assert summary["count"] == 7
+        assert 0 < summary["mean_confidence"] <= 1.0
+        assert summary["high_confidence_count"] >= 0
+
+
+# ── Round 2 Improvements: Stress Tests ──────────────────────────
+
+class TestPipelineStateIsolation:
+    """Verify no state leaks between pipeline runs."""
+
+    def test_consecutive_runs_are_independent(self):
+        """Running the pipeline twice should give fresh results each time."""
+        pipeline = DataPipeline(store_dir="/tmp/mirofish_test_isolation")
+
+        claims_a = [
+            _make_claim("src_x", f"Run1 claim {i}",
+                        ClaimCategory.SBA_LENDING, ClaimType.METRIC,
+                        value=100 + i, claim_id=f"run1_{i}")
+            for i in range(3)
+        ]
+        claims_b = [
+            _make_claim("src_y", f"Run1 corr {i}",
+                        ClaimCategory.SBA_LENDING, ClaimType.METRIC,
+                        value=100 + i, claim_id=f"run1c_{i}")
+            for i in range(3)
+        ]
+        pipeline.register_source(MockTier1Source("src_x", claims_a))
+        pipeline.register_source(MockTier1Source("src_y", claims_b))
+
+        result1 = pipeline.run()
+        count1 = result1["stats"]["total"]
+
+        # Run again — extractor dedup should be cleared, so same counts
+        result2 = pipeline.run()
+        count2 = result2["stats"]["total"]
+
+        assert count1 == count2, (
+            f"State leak: run1 got {count1} claims, run2 got {count2}"
+        )
+
+    def test_store_is_clean_between_runs(self):
+        """Validated store should be empty at start of each run."""
+        pipeline = DataPipeline(store_dir="/tmp/mirofish_test_clean")
+        pipeline.register_source(MockTier1Source("s1", [
+            _make_claim("s1", "c1", ClaimCategory.SBA_LENDING,
+                        ClaimType.METRIC, claim_id="iso1"),
+        ]))
+        pipeline.register_source(MockTier1Source("s2", [
+            _make_claim("s2", "c2", ClaimCategory.SBA_LENDING,
+                        ClaimType.METRIC, claim_id="iso2"),
+        ]))
+
+        pipeline.run()
+        # Store should have data
+        stored = pipeline.store.get_all()
+
+        pipeline.run()
+        # Store should have same count, not double
+        stored2 = pipeline.store.get_all()
+        assert len(stored2) == len(stored)
+
+
+class TestGateBoundaryConditions:
+    """Test the exact gate thresholds."""
+
+    def _make_store(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("s1"))
+        registry.register(MockTier2Source("s2"))
+        validator = CrossValidator(registry)
+        breaker = CircuitBreaker(registry)
+        return ValidatedDataStore(registry, validator, breaker)
+
+    def test_exactly_minimum_claims_opens_gate(self):
+        """5 actionable claims (the minimum) across 2 categories should open."""
+        store = self._make_store()
+        results = []
+        # 3 in SBA_LENDING + 2 in INTEREST_RATES = 5 total, 2 categories
+        for i in range(3):
+            results.append(ValidationResult(
+                claim=_make_claim("s1", f"sba {i}", ClaimCategory.SBA_LENDING,
+                                  ClaimType.METRIC, claim_id=f"gate_sba_{i}"),
+                consensus=ConsensusLevel.HIGH,
+                confidence=0.85,
+                confidence_interval=(0.7, 0.95),
+            ))
+        for i in range(2):
+            results.append(ValidationResult(
+                claim=_make_claim("s1", f"rate {i}", ClaimCategory.INTEREST_RATES,
+                                  ClaimType.METRIC, claim_id=f"gate_rate_{i}"),
+                consensus=ConsensusLevel.MEDIUM,
+                confidence=0.7,
+                confidence_interval=(0.55, 0.85),
+            ))
+        store.ingest(results)
+        is_open, _ = store.check_gate()
+        assert is_open
+
+    def test_below_minimum_claims_blocks_gate(self):
+        """4 actionable claims (below 5 minimum) should block."""
+        store = self._make_store()
+        results = []
+        for i in range(2):
+            results.append(ValidationResult(
+                claim=_make_claim("s1", f"few_sba {i}", ClaimCategory.SBA_LENDING,
+                                  ClaimType.METRIC, claim_id=f"few_sba_{i}"),
+                consensus=ConsensusLevel.HIGH,
+                confidence=0.85,
+                confidence_interval=(0.7, 0.95),
+            ))
+        for i in range(2):
+            results.append(ValidationResult(
+                claim=_make_claim("s1", f"few_rate {i}", ClaimCategory.INTEREST_RATES,
+                                  ClaimType.METRIC, claim_id=f"few_rate_{i}"),
+                consensus=ConsensusLevel.HIGH,
+                confidence=0.85,
+                confidence_interval=(0.7, 0.95),
+            ))
+        store.ingest(results)
+        is_open, reason = store.check_gate()
+        assert not is_open
+        assert "4" in reason  # Should mention the count
+
+    def test_single_category_blocks_gate(self):
+        """5+ claims but only 1 category should block."""
+        store = self._make_store()
+        results = [
+            ValidationResult(
+                claim=_make_claim("s1", f"mono {i}", ClaimCategory.SBA_LENDING,
+                                  ClaimType.METRIC, claim_id=f"mono_{i}"),
+                consensus=ConsensusLevel.HIGH,
+                confidence=0.85,
+                confidence_interval=(0.7, 0.95),
+            )
+            for i in range(10)
+        ]
+        store.ingest(results)
+        is_open, reason = store.check_gate()
+        assert not is_open
+        assert "categor" in reason.lower()
+
+
+class TestConflictAuditTrail:
+    """Verify conflict resolution produces an audit trail."""
+
+    def test_conflict_log_accumulates(self):
+        registry = SourceRegistry()
+        registry.register(MockTier1Source("a"))
+        registry.register(MockTier2Source("b"))
+        validator = CrossValidator(registry)
+
+        # Create two separate conflicts
+        claims_batch1 = [
+            _make_claim("a", "Rate up", ClaimCategory.INTEREST_RATES,
+                        ClaimType.TREND, direction="up", claim_id="aud1"),
+            _make_claim("b", "Rate down", ClaimCategory.INTEREST_RATES,
+                        ClaimType.TREND, direction="down", claim_id="aud2"),
+        ]
+        claims_batch2 = [
+            _make_claim("a", "Deals up", ClaimCategory.DEAL_MULTIPLES,
+                        ClaimType.TREND, direction="up", claim_id="aud3"),
+            _make_claim("b", "Deals down", ClaimCategory.DEAL_MULTIPLES,
+                        ClaimType.TREND, direction="down", claim_id="aud4"),
+        ]
+
+        validator.validate_claims(claims_batch1)
+        validator.validate_claims(claims_batch2)
+
+        log = validator.get_conflict_log()
+        assert len(log) >= 2
+        assert all("resolution" in entry for entry in log)
+        assert all("timestamp" in entry for entry in log)
+
+
+class TestSourceWeightFloor:
+    """Verify the weight floor is enforced."""
+
+    def test_weight_never_drops_below_floor(self):
+        """Even with terrible track record, floor is base * 0.5."""
+        source = MockTier1Source("floored")
+        base = source.base_weight  # 0.9
+        floor = base * 0.5  # 0.45
+
+        # 100 claims, all contradicted, 50% fetch failures
+        for _ in range(100):
+            source.health.total_claims += 1
+            source.health.record_claim_contradicted()
+        for _ in range(50):
+            source.health.record_fetch_failure("bad")
+        for _ in range(50):
+            source.health.record_fetch_success()
+
+        weight = source.effective_weight
+        assert weight >= floor, f"Weight {weight} dropped below floor {floor}"
+
+
+class TestRealSourceInstantiation:
+    """Verify real data source classes can instantiate and produce claims."""
+
+    def test_bizbuysell_produces_claims(self):
+        from app.services.data_pipeline import BizBuySellSource
+        source = BizBuySellSource()
+
+        assert source.trust_tier == TrustTier.TIER_2
+        assert source.source_id == "bizbuysell"
+
+        claims = source.fetch_claims()
+        # Should produce benchmark + sector claims
+        assert len(claims) > 0
+        assert all(isinstance(c, Claim) for c in claims)
+        assert source.health.fetch_successes >= 1
+
+        # Verify sector multiples are present
+        naics_codes = {c.naics_code for c in claims if c.naics_code}
+        assert len(naics_codes) > 0  # Should have NAICS-tagged claims
+
+    def test_ibba_produces_claims(self):
+        from app.services.data_pipeline import IBBAMarketPulseSource
+        source = IBBAMarketPulseSource()
+
+        assert source.trust_tier == TrustTier.TIER_2
+        assert source.source_id == "ibba_market_pulse"
+
+        claims = source.fetch_claims()
+        assert len(claims) > 0
+        assert all(isinstance(c, Claim) for c in claims)
+
+        # Should cover multiple categories
+        categories = {c.category for c in claims}
+        assert len(categories) >= 3  # buyer_demand, seller_supply, market_sentiment, sba_lending
+
+    def test_ibba_category_filter(self):
+        """Filtering by category should return fewer claims."""
+        from app.services.data_pipeline import IBBAMarketPulseSource
+        source = IBBAMarketPulseSource()
+
+        all_claims = source.fetch_claims()
+        filtered = source.fetch_claims(category=ClaimCategory.BUYER_DEMAND)
+        assert len(filtered) < len(all_claims)
+        assert all(c.category == ClaimCategory.BUYER_DEMAND for c in filtered)
+
+    def test_bizbuysell_category_filter(self):
+        from app.services.data_pipeline import BizBuySellSource
+        source = BizBuySellSource()
+
+        all_claims = source.fetch_claims()
+        filtered = source.fetch_claims(category=ClaimCategory.SELLER_SUPPLY)
+        assert len(filtered) < len(all_claims)
+
+    def test_sba_source_without_api(self):
+        """SBA source with no network should handle gracefully."""
+        from app.services.data_pipeline import SBADataSource
+        source = SBADataSource()
+        assert source.trust_tier == TrustTier.TIER_1
+        # Don't call fetch_claims — it hits the real API
+        # Just verify it instantiates cleanly
+
+    def test_fred_source_without_key(self):
+        """FRED source without API key should return empty, not crash."""
+        from app.services.data_pipeline import FREDDataSource
+        source = FREDDataSource(api_key=None)
+        # Should not have a key
+        source.api_key = None
+
+        claims = source.fetch_claims()
+        assert claims == []  # No key = no data, no crash
+        assert source.health.fetch_successes >= 1  # Records as success (unconfigured, not failure)
 
 
 if __name__ == "__main__":

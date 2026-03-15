@@ -171,21 +171,24 @@ class CircuitBreaker:
             self._claim_volume_history[source_id] = []
 
         history = self._claim_volume_history[source_id]
-        history.append(claim_count)
 
-        # Need at least 3 data points to detect spikes
+        # Compare new count against PRIOR history (not including new value)
+        # to avoid the spike averaging itself in
         if len(history) >= 3:
-            recent_avg = sum(history[-3:]) / 3
-            if recent_avg > 0 and claim_count > recent_avg * self.MAX_CLAIM_SPIKE_RATIO:
+            prior_avg = sum(history[-3:]) / 3
+            if prior_avg > 0 and claim_count > prior_avg * self.MAX_CLAIM_SPIKE_RATIO:
                 alerts.append(self._create_alert(
                     AlertSeverity.WARNING,
                     source_id,
                     f"Claim volume spike from {source_id}: {claim_count} "
-                    f"(avg: {recent_avg:.0f})",
+                    f"(avg: {prior_avg:.0f})",
                     "claim_volume_spike",
                     float(claim_count),
-                    recent_avg * self.MAX_CLAIM_SPIKE_RATIO,
+                    prior_avg * self.MAX_CLAIM_SPIKE_RATIO,
                 ))
+
+        # Append AFTER comparison so spike doesn't contaminate baseline
+        history.append(claim_count)
 
         # Keep only last 20 data points
         if len(history) > 20:

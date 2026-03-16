@@ -203,12 +203,30 @@ providers throughout. Structure the document with clear section headers."""
             return seed_text
 
         # Gate closed — fall back to unvalidated LLM generation
-        # This is the existing behavior, but now properly labeled
         gate_reason = pipeline_result["gate_reason"]
         logger.warning(
             f"Data pipeline gate CLOSED: {gate_reason}. "
             f"Falling back to unvalidated LLM generation."
         )
+
+        if not self.llm_client:
+            # No LLM available either — return what we have from the pipeline
+            logger.warning("No LLM client available for fallback. Using raw pipeline data.")
+            raw_claims = pipeline_result.get("all_claims", [])
+            if raw_claims:
+                lines = [f"- {c.get('description', c.get('metric', 'unknown'))}: {c.get('value', 'N/A')}"
+                         for c in raw_claims]
+                return (
+                    "# Data Pipeline Results (Unvalidated)\n\n"
+                    f"Gate closed: {gate_reason}\n\n"
+                    + "\n".join(lines)
+                )
+            return (
+                "# No Data Available\n\n"
+                f"Pipeline gate closed: {gate_reason}\n"
+                "No LLM fallback configured. Set FRED_API_KEY in backend/.env "
+                "and/or LLM_API_KEY for full functionality."
+            )
 
         messages = [
             {"role": "user", "content": self.SEED_CONTENT_PROMPT}

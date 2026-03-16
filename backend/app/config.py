@@ -67,9 +67,17 @@ class Config:
     def validate(cls):
         """验证必要配置"""
         errors = []
+        # LLM and Zep keys are optional — only needed for simulation features.
+        # FRED_API_KEY is sufficient for broker-trends.
         if not cls.LLM_API_KEY:
-            errors.append("LLM_API_KEY 未配置")
+            import logging
+            logging.getLogger('mirofish').warning(
+                "LLM_API_KEY not configured — simulation features will be unavailable"
+            )
         if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
+            import logging
+            logging.getLogger('mirofish').warning(
+                "ZEP_API_KEY not configured — memory features will be unavailable"
+            )
         return errors
 

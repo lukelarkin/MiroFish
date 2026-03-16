@@ -110,7 +110,13 @@ providers throughout. Structure the document with clear section headers."""
     PREDICTIONS_DIR = os.path.join(Config.UPLOAD_FOLDER, 'predictions')
 
     def __init__(self):
-        self.llm_client = LLMClient()
+        # LLM client is optional — only needed for unvalidated fallback and
+        # downstream simulation stages. The FRED data pipeline works without it.
+        try:
+            self.llm_client = LLMClient()
+        except ValueError:
+            self.llm_client = None
+            logger.warning("LLM client unavailable — only validated data pipeline will work")
         self.task_manager = TaskManager()
         self.pipeline = self._init_pipeline()
         os.makedirs(self.PREDICTIONS_DIR, exist_ok=True)
@@ -136,9 +142,10 @@ providers throughout. Structure the document with clear section headers."""
         pipeline.register_source(IBBAMarketPulseSource())
 
         # SYNTHETIC: LLM-generated (always last, lowest trust)
-        pipeline.register_source(LLMSyntheticSource(
-            llm_client=self.llm_client
-        ))
+        if self.llm_client:
+            pipeline.register_source(LLMSyntheticSource(
+                llm_client=self.llm_client
+            ))
 
         logger.info(
             f"Data pipeline initialized with {pipeline.registry.source_count} sources. "

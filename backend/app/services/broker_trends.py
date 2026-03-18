@@ -390,10 +390,13 @@ providers throughout. Structure the document with clear section headers."""
                 )
             except Exception as llm_err:
                 # Check if this looks like an LLM/API error
-                err_str = str(llm_err).lower()
+                err_type = type(llm_err).__module__ + '.' + type(llm_err).__name__
+                err_str = (str(llm_err) + ' ' + err_type).lower()
                 is_llm_error = any(kw in err_str for kw in [
                     'api key', 'authentication', '401', '403', 'rate limit',
                     '429', 'quota', 'openai', 'llm', 'api_key',
+                    'connection error', 'apiconnection', 'apierror',
+                    'timeout', 'api_error',
                 ])
                 if is_llm_error:
                     logger.warning(

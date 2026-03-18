@@ -389,18 +389,18 @@ providers throughout. Structure the document with clear section headers."""
                     seed_text, pipeline_result, pred_state
                 )
             except Exception as llm_err:
-                # Check if this looks like an LLM/API error
+                # Check if this is a service config/API error we can recover from
                 err_type = type(llm_err).__module__ + '.' + type(llm_err).__name__
                 err_str = (str(llm_err) + ' ' + err_type).lower()
-                is_llm_error = any(kw in err_str for kw in [
-                    'api key', 'authentication', '401', '403', 'rate limit',
-                    '429', 'quota', 'openai', 'llm', 'api_key',
+                is_recoverable = any(kw in err_str for kw in [
+                    'api key', 'api_key', 'authentication', '401', '403',
+                    'rate limit', '429', 'quota', 'openai', 'llm',
                     'connection error', 'apiconnection', 'apierror',
-                    'timeout', 'api_error',
+                    'timeout', 'api_error', 'zep', '未配置',
                 ])
-                if is_llm_error:
+                if is_recoverable:
                     logger.warning(
-                        f"LLM error during simulation stages: {llm_err}. "
+                        f"Recoverable error during pipeline stages: {llm_err}. "
                         f"Falling back to data-only report."
                     )
                     self._generate_data_only_report(
@@ -409,7 +409,7 @@ providers throughout. Structure the document with clear section headers."""
                     )
                     return
                 else:
-                    raise  # Re-raise non-LLM errors
+                    raise  # Re-raise unexpected errors
 
         except Exception as e:
             import traceback
@@ -457,6 +457,19 @@ providers throughout. Structure the document with clear section headers."""
         )
 
         # ===== Stage 3: Build knowledge graph (20-55%) =====
+        # Graph builder requires Zep — skip if not configured
+        if not Config.ZEP_API_KEY:
+            logger.info("ZEP_API_KEY not configured — skipping graph/simulation stages, generating LLM report directly")
+            self.task_manager.update_task(
+                task_id, progress=55,
+                message="Skipping graph/simulation (Zep not configured) — generating report..."
+            )
+            self._generate_llm_report(
+                prediction_id, project_id, task_id,
+                seed_text, ontology, pipeline_result, pred_state
+            )
+            return
+
         pred_state["current_stage"] = "building_graph"
         self._save_prediction_state(prediction_id, pred_state)
 
@@ -747,6 +760,134 @@ providers throughout. Structure the document with clear section headers."""
         })
 
         logger.info(f"Data-only report generated: {prediction_id} -> {report_id}")
+
+    def _generate_llm_report(
+        self, prediction_id: str, project_id: str, task_id: str,
+        seed_text: str, ontology: Dict[str, Any],
+        pipeline_result: Dict[str, Any], pred_state: Dict[str, Any]
+    ):
+        """
+        Generate a full LLM-powered report from seed content + ontology,
+        skipping graph/simulation stages (used when Zep is not configured).
+        """
+        report_id = f"report_{uuid.uuid4().hex[:12]}"
+        pred_state["report_id"] = report_id
+        pred_state["current_stage"] = "generating_llm_report"
+        self._save_prediction_state(prediction_id, pred_state)
+
+        self.task_manager.update_task(
+            task_id, progress=60,
+            message="Generating AI-powered analysis report..."
+        )
+
+        # Build the report prompt with ontology context
+        entity_types = ontology.get("entity_types", [])
+        relationship_types = ontology.get("relationship_types", [])
+        analysis_summary = ontology.get("analysis_summary", "")
+
+        entity_list = ", ".join(
+            e.get("name", e.get("label", "unknown")) for e in entity_types[:20]
+        ) if entity_types else "N/A"
+        rel_list = ", ".join(
+            r.get("name", r.get("label", "unknown")) for r in relationship_types[:15]
+        ) if relationship_types else "N/A"
+
+        # Pipeline stats for context
+        stats = pipeline_result.get("stats", {})
+        stats_text = (
+            f"Pipeline fetched {stats.get('total', 0)} claims, "
+            f"{stats.get('actionable', 0)} actionable, "
+            f"avg confidence {stats.get('avg_confidence', 0):.2f}, "
+            f"{stats.get('conflicts', 0)} conflicts detected."
+        )
+
+        report_prompt = f"""You are a senior business brokerage market analyst. Based on the market data
+and ontology analysis below, produce a comprehensive, actionable market trends report.
+
+## Ontology Analysis
+Entities identified: {entity_list}
+Relationships identified: {rel_list}
+Summary: {analysis_summary}
+
+## Pipeline Statistics
+{stats_text}
+
+## Market Data & Seed Content
+{seed_text[:12000]}
+
+## Report Requirements
+Write a professional markdown report with these sections:
+1. **Executive Summary** — 3-4 paragraph overview of key findings
+2. **Market Conditions** — Current state of the business brokerage market
+3. **Key Trends** — 5-8 numbered trends with impact analysis
+4. **Sector Analysis** — Performance by industry sector
+5. **Risk Factors** — Key risks and headwinds
+6. **Opportunities** — Actionable opportunities for brokers
+7. **Outlook & Predictions** — 6-12 month forward-looking analysis
+8. **Recommendations** — Specific action items for business brokers
+
+Use specific data points from the seed content. Include confidence levels where possible.
+Format as clean markdown with headers, bullet points, and bold for emphasis."""
+
+        self.task_manager.update_task(
+            task_id, progress=65,
+            message="Claude is analyzing market data..."
+        )
+
+        report_markdown = self.llm_client.chat(
+            messages=[{"role": "user", "content": report_prompt}],
+            temperature=0.5,
+            max_tokens=8192
+        )
+
+        # Add report header
+        now = datetime.now()
+        header = (
+            f"# Business Brokerage Market Trends Report\n\n"
+            f"**Generated:** {now.strftime('%B %d, %Y')}\n"
+            f"**Mode:** AI-Powered Analysis (Claude)\n"
+            f"**Entities Analyzed:** {len(entity_types)}\n"
+            f"**Relationships Mapped:** {len(relationship_types)}\n\n"
+            f"---\n\n"
+        )
+        full_markdown = header + report_markdown
+
+        self.task_manager.update_task(
+            task_id, progress=95,
+            message="Finalizing report..."
+        )
+
+        # Save report
+        from .report_agent import Report, ReportManager, ReportStatus
+        report = Report(
+            report_id=report_id,
+            simulation_id="none",
+            graph_id="none",
+            simulation_requirement=self.SIMULATION_REQUIREMENT,
+            status=ReportStatus.COMPLETED,
+            markdown_content=full_markdown,
+            created_at=now.isoformat(),
+            completed_at=now.isoformat(),
+        )
+        ReportManager.save_report(report)
+
+        # Complete
+        pred_state["status"] = "completed"
+        pred_state["current_stage"] = "completed"
+        pred_state["report_id"] = report.report_id
+        self._save_prediction_state(prediction_id, pred_state)
+
+        self.task_manager.update_task(task_id, progress=100, message="任务完成")
+        self.task_manager.complete_task(task_id, {
+            "prediction_id": prediction_id,
+            "project_id": project_id,
+            "report_id": report.report_id,
+            "status": "completed",
+            "validated": pipeline_result.get("gate_open", False),
+            "data_only": False,
+        })
+
+        logger.info(f"LLM report generated: {prediction_id} -> {report_id}")
 
     def get_pipeline_health(self) -> Dict[str, Any]:
         """Get current data pipeline health status."""

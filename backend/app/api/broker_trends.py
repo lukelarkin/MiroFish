@@ -190,6 +190,59 @@ def get_prediction(prediction_id: str):
         }), 500
 
 
+@broker_trends_bp.route('/predictions/<prediction_id>/risk-assessment', methods=['GET'])
+def get_risk_assessment(prediction_id: str):
+    """
+    Get the actuarial risk assessment for a prediction.
+
+    Returns the reliability grade (A-F), overall confidence score,
+    risk factors, probability distribution, and recommendations.
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "overall_reliability_grade": "B",
+                "overall_confidence": 0.72,
+                "prediction_strength": "Moderate",
+                "risk_factors": [...],
+                "probability_distribution": {...},
+                "concentration_risk": {...},
+                "data_sufficiency": {...},
+                "recommendations": [...]
+            }
+        }
+    """
+    try:
+        service = BrokerTrendService()
+        pred_state = service._load_prediction_state(prediction_id)
+
+        if not pred_state:
+            return jsonify({
+                "success": False,
+                "error": f"Prediction not found: {prediction_id}"
+            }), 404
+
+        assessment = pred_state.get("actuary_assessment")
+        if not assessment:
+            return jsonify({
+                "success": False,
+                "error": "Risk assessment not yet available. The prediction may still be in progress."
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "data": assessment
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to get risk assessment: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
 @broker_trends_bp.route('/pipeline/health', methods=['GET'])
 def pipeline_health():
     """

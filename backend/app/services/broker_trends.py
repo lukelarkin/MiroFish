@@ -32,6 +32,7 @@ from .data_pipeline import (
     DataPipeline, LLMSyntheticSource,
     SBADataSource, FREDDataSource, BizBuySellSource, IBBAMarketPulseSource,
 )
+from .actuary import ActuaryEngine
 
 logger = get_logger('mirofish.broker_trends')
 
@@ -332,12 +333,18 @@ providers throughout. Structure the document with clear section headers."""
             pipeline_result = self.pipeline.run()
             pipeline_health = pipeline_result.get("health", {})
 
-            # Save pipeline health to prediction state for diagnostics
+            # Run actuarial risk assessment on validated data
+            actuary = ActuaryEngine()
+            validated_results = pipeline_result.get("validated_results", [])
+            actuary_assessment = actuary.assess(validated_results)
+
+            # Save pipeline health + actuary assessment to prediction state
             pred_state["pipeline_health"] = {
                 "gate_open": pipeline_result["gate_open"],
                 "gate_reason": pipeline_result["gate_reason"],
                 "stats": pipeline_result.get("stats", {}),
             }
+            pred_state["actuary_assessment"] = actuary_assessment.to_dict()
             self._save_prediction_state(prediction_id, pred_state)
 
             self.task_manager.update_task(
@@ -358,6 +365,8 @@ providers throughout. Structure the document with clear section headers."""
 
             if pipeline_result["gate_open"]:
                 seed_text = pipeline_result["seed_text"]
+                # Append actuarial assessment to seed text for downstream consumers
+                seed_text += "\n\n" + actuary_assessment.to_markdown()
             else:
                 # Fallback to LLM generation
                 seed_text = self.generate_seed_content()
@@ -412,10 +421,8 @@ providers throughout. Structure the document with clear section headers."""
                     raise  # Re-raise unexpected errors
 
         except Exception as e:
-            import traceback
             error_msg = str(e)
-            logger.error(f"Broker trends prediction failed: {prediction_id}: {error_msg}")
-            logger.error(traceback.format_exc())
+            logger.exception(f"Broker trends prediction failed: {prediction_id}: {error_msg}")
 
             pred_state["status"] = "failed"
             pred_state["error"] = error_msg

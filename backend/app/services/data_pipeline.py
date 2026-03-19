@@ -165,6 +165,7 @@ class DataPipeline:
             "health": self.store.health_report(),
             "stats": stats,
             "ingestion": ingestion,
+            "validated_results": validation_results,
         }
 
     def run_health_check(self) -> Dict[str, Any]:
@@ -180,6 +181,7 @@ class DataPipeline:
             "health": self.store.health_report(),
             "stats": {"total": 0},
             "ingestion": {},
+            "validated_results": [],
         }
 
 

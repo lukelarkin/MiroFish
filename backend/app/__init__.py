@@ -9,7 +9,9 @@ import warnings
 # 需要在所有其他导入之前设置
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request
+import traceback
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from .config import Config
@@ -74,8 +76,27 @@ def create_app(config_class=Config):
     def health():
         return {'status': 'ok', 'service': 'MiroFish Backend'}
     
+    # Global error handlers — return JSON, never leak tracebacks to client
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({"success": False, "error": "Not found"}), 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(e):
+        return jsonify({"success": False, "error": "Method not allowed"}), 405
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        logger.error(f"Internal server error: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": "Internal server error"}), 500
+
+    @app.errorhandler(Exception)
+    def unhandled_exception(e):
+        logger.error(f"Unhandled exception: {traceback.format_exc()}")
+        return jsonify({"success": False, "error": "An unexpected error occurred"}), 500
+
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
-    
+
     return app
 

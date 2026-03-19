@@ -3,7 +3,6 @@ Broker Trends API routes
 Provides endpoints for business brokerage trends prediction
 """
 
-import traceback
 from flask import request, jsonify
 
 from . import broker_trends_bp
@@ -49,8 +48,7 @@ def predict():
         logger.error(f"Failed to start prediction: {str(e)}")
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500
 
 
@@ -188,8 +186,7 @@ def get_prediction(prediction_id: str):
         logger.error(f"Failed to get prediction: {str(e)}")
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500
 
 
@@ -223,6 +220,5 @@ def pipeline_health():
         logger.error(f"Failed to get pipeline health: {str(e)}")
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500

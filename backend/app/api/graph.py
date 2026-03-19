@@ -4,7 +4,6 @@
 """
 
 import os
-import traceback
 import threading
 from flask import request, jsonify
 
@@ -249,8 +248,7 @@ def generate_ontology():
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500
 
 
@@ -489,8 +487,7 @@ def build_graph():
                 
             except Exception as e:
                 # 更新项目状态为失败
-                build_logger.error(f"[{task_id}] 图谱构建失败: {str(e)}")
-                build_logger.debug(traceback.format_exc())
+                build_logger.exception(f"[{task_id}] 图谱构建失败: {str(e)}")
                 
                 project.status = ProjectStatus.FAILED
                 project.error = str(e)
@@ -500,7 +497,7 @@ def build_graph():
                     task_id,
                     status=TaskStatus.FAILED,
                     message=f"构建失败: {str(e)}",
-                    error=traceback.format_exc()
+                    error=str(e)
                 )
         
         # 启动后台线程
@@ -519,8 +516,7 @@ def build_graph():
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500
 
 
@@ -584,8 +580,7 @@ def get_graph_data(graph_id: str):
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500
 
 
@@ -612,6 +607,5 @@ def delete_graph(graph_id: str):
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            "error": str(e)
         }), 500

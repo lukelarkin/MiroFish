@@ -7,7 +7,7 @@ import sys
 
 # Load .env file (contains FRED_API_KEY, etc.)
 from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 
 # 解决 Windows 控制台中文乱码问题：在所有导入之前设置 UTF-8 编码
 if sys.platform == 'win32':
